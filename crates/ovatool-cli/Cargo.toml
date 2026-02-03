@@ -1,0 +1,17 @@
+[package]
+name = "ovatool-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI tool for exporting VMware VMs to OVA format"
+
+[[bin]]
+name = "ovatool"
+path = "src/main.rs"
+
+[dependencies]
+ovatool-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true

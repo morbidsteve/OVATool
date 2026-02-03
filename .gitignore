@@ -15,3 +15,6 @@
 *.ova
 *.vmdk
 *.vmx
+
+# Allow test fixtures
+!**/tests/fixtures/*.vmx

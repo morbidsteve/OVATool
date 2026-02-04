@@ -7,3 +7,4 @@ pub mod descriptor;
 pub mod reader;
 
 pub use descriptor::{parse_descriptor, Extent, ExtentType, VmdkDescriptor};
+pub use reader::{ChunkIterator, IndexedChunk, IndexedChunkIterator, VmdkReader};

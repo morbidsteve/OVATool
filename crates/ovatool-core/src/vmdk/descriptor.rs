@@ -126,10 +126,7 @@ pub fn parse_descriptor(content: &str) -> Result<VmdkDescriptor> {
         }
 
         // Check for extent line (starts with access mode)
-        if line.starts_with("RW ")
-            || line.starts_with("RDONLY ")
-            || line.starts_with("NOACCESS ")
-        {
+        if line.starts_with("RW ") || line.starts_with("RDONLY ") || line.starts_with("NOACCESS ") {
             let extent = parse_extent_line(line)?;
             extents.push(extent);
             continue;
@@ -255,10 +252,7 @@ fn parse_quoted_filename_and_offset(s: &str) -> Result<(String, String)> {
     let s = s.trim();
 
     if !s.starts_with('"') {
-        return Err(Error::vmdk(format!(
-            "expected quoted filename, got: {}",
-            s
-        )));
+        return Err(Error::vmdk(format!("expected quoted filename, got: {}", s)));
     }
 
     // Find the closing quote
@@ -288,8 +282,14 @@ mod tests {
             ExtentType::from_str("VMFSSPARSE").unwrap(),
             ExtentType::VmfsSparse
         );
-        assert_eq!(ExtentType::from_str("VMFSRDM").unwrap(), ExtentType::VmfsRdm);
-        assert_eq!(ExtentType::from_str("VMFSRAW").unwrap(), ExtentType::VmfsRaw);
+        assert_eq!(
+            ExtentType::from_str("VMFSRDM").unwrap(),
+            ExtentType::VmfsRdm
+        );
+        assert_eq!(
+            ExtentType::from_str("VMFSRAW").unwrap(),
+            ExtentType::VmfsRaw
+        );
     }
 
     #[test]

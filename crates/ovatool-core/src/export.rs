@@ -26,7 +26,10 @@ use crate::error::{Error, Result};
 use crate::ova::OvaWriter;
 use crate::ovf::{DiskInfo, OvfBuilder};
 use crate::pipeline::{CompressionLevel, Pipeline, PipelineConfig};
-use crate::vmdk::{compress_grain, parse_descriptor, ExtentType, StreamVmdkWriter, VmdkReader};
+use crate::vmdk::{
+    compress_grain, is_sparse_vmdk, parse_descriptor, ExtentType, SparseVmdkReader,
+    StreamVmdkWriter, VmdkReader,
+};
 use crate::vmx::{parse_vmx, VmxConfig};
 
 /// Default chunk size for processing (64 MB).
@@ -200,12 +203,20 @@ pub fn get_vm_info(vmx_path: &Path) -> Result<VmInfo> {
     for disk_config in &config.disks {
         let vmdk_path = vmx_dir.join(&disk_config.file_name);
 
-        // Try to read the VMDK descriptor
+        // Try to read the VMDK descriptor or sparse header
         let (size_bytes, create_type) = if vmdk_path.exists() {
-            let content = fs::read_to_string(&vmdk_path)
-                .map_err(|e| Error::io(e, &vmdk_path))?;
-            let descriptor = parse_descriptor(&content)?;
-            (descriptor.disk_size_bytes(), descriptor.create_type.clone())
+            // Check if this is a sparse VMDK (binary) or text descriptor
+            if is_sparse_vmdk(&vmdk_path)? {
+                // Sparse VMDK - read capacity from header
+                let sparse_reader = SparseVmdkReader::open(&vmdk_path)?;
+                (sparse_reader.capacity(), "monolithicSparse".to_string())
+            } else {
+                // Text descriptor
+                let content = fs::read_to_string(&vmdk_path)
+                    .map_err(|e| Error::io(e, &vmdk_path))?;
+                let descriptor = parse_descriptor(&content)?;
+                (descriptor.disk_size_bytes(), descriptor.create_type.clone())
+            }
         } else {
             // If descriptor doesn't exist, check for flat file
             let flat_name = disk_config.file_name.replace(".vmdk", "-flat.vmdk");
@@ -325,32 +336,55 @@ pub fn export_vm(
         progress.current_disk = disk_index + 1;
         report_progress(progress.clone());
 
-        // Get the VMDK descriptor path and parse it
+        // Get the VMDK path
         let vmdk_path = vmx_dir.join(&disk_config.file_name);
-        let descriptor_content = fs::read_to_string(&vmdk_path)
-            .map_err(|e| Error::io(e, &vmdk_path))?;
-        let descriptor = parse_descriptor(&descriptor_content)?;
 
-        // Find the flat extent (the actual data file)
-        let flat_extent = descriptor
-            .extents
-            .iter()
-            .find(|e| e.extent_type == ExtentType::Flat)
-            .ok_or_else(|| Error::vmdk("No flat extent found in VMDK descriptor"))?;
+        // Check if this is a sparse VMDK (binary) or a descriptor file (text)
+        let (data_path, capacity_bytes, is_sparse) = if is_sparse_vmdk(&vmdk_path)? {
+            // Sparse VMDK - the file itself contains the data
+            let sparse_reader = SparseVmdkReader::open(&vmdk_path)?;
+            let capacity = sparse_reader.capacity();
+            (vmdk_path.clone(), capacity, true)
+        } else {
+            // Text descriptor - parse it to find the data file
+            let descriptor_content = fs::read_to_string(&vmdk_path)
+                .map_err(|e| Error::io(e, &vmdk_path))?;
+            let descriptor = parse_descriptor(&descriptor_content)?;
 
-        let flat_path = vmx_dir.join(&flat_extent.filename);
-        let capacity_bytes = descriptor.disk_size_bytes();
+            // Find the flat extent (the actual data file)
+            let flat_extent = descriptor
+                .extents
+                .iter()
+                .find(|e| e.extent_type == ExtentType::Flat)
+                .ok_or_else(|| Error::vmdk("No flat extent found in VMDK descriptor"))?;
+
+            let flat_path = vmx_dir.join(&flat_extent.filename);
+            let capacity = descriptor.disk_size_bytes();
+            (flat_path, capacity, false)
+        };
 
         // Read and compress the disk data
-        let compressed_vmdk = process_disk(
-            &flat_path,
-            capacity_bytes,
-            &pipeline,
-            compression_level,
-            options.chunk_size,
-            &mut progress,
-            &progress_callback,
-        )?;
+        let compressed_vmdk = if is_sparse {
+            process_sparse_disk(
+                &data_path,
+                capacity_bytes,
+                &pipeline,
+                compression_level,
+                options.chunk_size,
+                &mut progress,
+                &progress_callback,
+            )?
+        } else {
+            process_disk(
+                &data_path,
+                capacity_bytes,
+                &pipeline,
+                compression_level,
+                options.chunk_size,
+                &mut progress,
+                &progress_callback,
+            )?
+        };
 
         // Store for later writing
         let output_filename = disk_config.file_name.clone();
@@ -459,6 +493,65 @@ fn process_disk(
     Ok(vmdk_buffer.into_inner())
 }
 
+/// Process a sparse VMDK: read grains, compress, and create streamOptimized VMDK.
+fn process_sparse_disk(
+    sparse_path: &Path,
+    capacity_bytes: u64,
+    pipeline: &Pipeline,
+    compression_level: u32,
+    chunk_size: usize,
+    progress: &mut ExportProgress,
+    progress_callback: &Option<ProgressCallback>,
+) -> Result<Vec<u8>> {
+    // Open the sparse VMDK
+    let reader = SparseVmdkReader::open(sparse_path)?;
+
+    // Collect all chunks for parallel processing
+    let chunks: Vec<Vec<u8>> = reader
+        .chunks(chunk_size)
+        .collect::<Result<Vec<_>>>()?;
+
+    let total_chunks = chunks.len();
+
+    // Compress chunks in parallel
+    let compressed_chunks: Vec<Vec<u8>> = pipeline.process(chunks, |_idx, chunk| {
+        compress_grain(&chunk, compression_level)
+    })?;
+
+    // Create streamOptimized VMDK in memory
+    let mut vmdk_buffer = Cursor::new(Vec::new());
+    let mut vmdk_writer = StreamVmdkWriter::new(&mut vmdk_buffer, capacity_bytes)?;
+
+    // Write compressed grains
+    let mut bytes_written = 0u64;
+    for (chunk_idx, compressed_chunk) in compressed_chunks.into_iter().enumerate() {
+        // Calculate LBA for this chunk (in sectors)
+        let chunk_offset_bytes = chunk_idx as u64 * chunk_size as u64;
+        let lba = chunk_offset_bytes / 512; // Convert to sectors
+
+        // Write the grain (the stream writer handles grain-level addressing)
+        vmdk_writer.write_grain(lba, &compressed_chunk)?;
+
+        // Update progress
+        let original_chunk_size = if chunk_idx < total_chunks - 1 {
+            chunk_size as u64
+        } else {
+            capacity_bytes - (chunk_idx as u64 * chunk_size as u64)
+        };
+        bytes_written += original_chunk_size;
+        progress.bytes_processed = bytes_written;
+
+        if let Some(ref callback) = progress_callback {
+            callback(progress.clone());
+        }
+    }
+
+    // Finish the VMDK (writes grain tables, directory, footer, etc.)
+    vmdk_writer.finish()?;
+
+    Ok(vmdk_buffer.into_inner())
+}
+
 /// Calculate total disk size from VMX config.
 fn calculate_total_disk_size(config: &VmxConfig, vmx_dir: &Path) -> Result<u64> {
     let mut total = 0u64;
@@ -467,17 +560,25 @@ fn calculate_total_disk_size(config: &VmxConfig, vmx_dir: &Path) -> Result<u64> 
         let vmdk_path = vmx_dir.join(&disk_config.file_name);
 
         if vmdk_path.exists() {
-            let content = fs::read_to_string(&vmdk_path)
-                .map_err(|e| Error::io(e, &vmdk_path))?;
-            let descriptor = parse_descriptor(&content)?;
+            // Check if this is a sparse VMDK or a text descriptor
+            if is_sparse_vmdk(&vmdk_path)? {
+                // Sparse VMDK - use the virtual capacity
+                let sparse_reader = SparseVmdkReader::open(&vmdk_path)?;
+                total += sparse_reader.capacity();
+            } else {
+                // Text descriptor
+                let content = fs::read_to_string(&vmdk_path)
+                    .map_err(|e| Error::io(e, &vmdk_path))?;
+                let descriptor = parse_descriptor(&content)?;
 
-            // Find the flat extent to get actual file size
-            if let Some(flat_extent) = descriptor.extents.iter().find(|e| e.extent_type == ExtentType::Flat) {
-                let flat_path = vmx_dir.join(&flat_extent.filename);
-                if flat_path.exists() {
-                    let metadata = fs::metadata(&flat_path)
-                        .map_err(|e| Error::io(e, &flat_path))?;
-                    total += metadata.len();
+                // Find the flat extent to get actual file size
+                if let Some(flat_extent) = descriptor.extents.iter().find(|e| e.extent_type == ExtentType::Flat) {
+                    let flat_path = vmx_dir.join(&flat_extent.filename);
+                    if flat_path.exists() {
+                        let metadata = fs::metadata(&flat_path)
+                            .map_err(|e| Error::io(e, &flat_path))?;
+                        total += metadata.len();
+                    }
                 }
             }
         }

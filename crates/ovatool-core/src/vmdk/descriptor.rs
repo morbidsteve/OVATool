@@ -234,9 +234,13 @@ fn parse_extent_line(line: &str) -> Result<Extent> {
 
     let (filename, offset_str) = parse_quoted_filename_and_offset(&rest_of_line)?;
 
-    let offset: u64 = offset_str
-        .parse()
-        .map_err(|_| Error::vmdk(format!("invalid extent offset: {}", offset_str)))?;
+    // Offset is optional (SPARSE extents don't have one), default to 0
+    let offset: u64 = match offset_str {
+        Some(s) => s
+            .parse()
+            .map_err(|_| Error::vmdk(format!("invalid extent offset: {}", s)))?,
+        None => 0,
+    };
 
     Ok(Extent {
         access,
@@ -247,8 +251,9 @@ fn parse_extent_line(line: &str) -> Result<Extent> {
     })
 }
 
-/// Parse a quoted filename followed by an offset from a string like: "filename.vmdk" 0
-fn parse_quoted_filename_and_offset(s: &str) -> Result<(String, String)> {
+/// Parse a quoted filename followed by an optional offset from a string like: "filename.vmdk" 0
+/// Some extent types (like SPARSE) don't have an offset, so it defaults to 0.
+fn parse_quoted_filename_and_offset(s: &str) -> Result<(String, Option<String>)> {
     let s = s.trim();
 
     if !s.starts_with('"') {
@@ -262,9 +267,16 @@ fn parse_quoted_filename_and_offset(s: &str) -> Result<(String, String)> {
         + 1;
 
     let filename = s[1..end_quote].to_string();
-    let offset_str = s[end_quote + 1..].trim().to_string();
+    let offset_str = s[end_quote + 1..].trim();
 
-    Ok((filename, offset_str))
+    // Offset is optional - return None if empty
+    let offset = if offset_str.is_empty() {
+        None
+    } else {
+        Some(offset_str.to_string())
+    };
+
+    Ok((filename, offset))
 }
 
 #[cfg(test)]
@@ -342,7 +354,7 @@ mod tests {
     fn test_parse_quoted_filename_and_offset() {
         let (filename, offset) = parse_quoted_filename_and_offset("\"disk.vmdk\" 0").unwrap();
         assert_eq!(filename, "disk.vmdk");
-        assert_eq!(offset, "0");
+        assert_eq!(offset, Some("0".to_string()));
     }
 
     #[test]
@@ -350,7 +362,24 @@ mod tests {
         let (filename, offset) =
             parse_quoted_filename_and_offset("\"my disk file.vmdk\" 128").unwrap();
         assert_eq!(filename, "my disk file.vmdk");
-        assert_eq!(offset, "128");
+        assert_eq!(offset, Some("128".to_string()));
+    }
+
+    #[test]
+    fn test_parse_quoted_filename_no_offset() {
+        let (filename, offset) = parse_quoted_filename_and_offset("\"sparse.vmdk\"").unwrap();
+        assert_eq!(filename, "sparse.vmdk");
+        assert_eq!(offset, None);
+    }
+
+    #[test]
+    fn test_parse_extent_line_sparse_no_offset() {
+        let extent = parse_extent_line("RW 12345 SPARSE \"disk.vmdk\"").unwrap();
+        assert_eq!(extent.access, "RW");
+        assert_eq!(extent.size_sectors, 12345);
+        assert_eq!(extent.extent_type, ExtentType::Sparse);
+        assert_eq!(extent.filename, "disk.vmdk");
+        assert_eq!(extent.offset, 0);
     }
 
     #[test]

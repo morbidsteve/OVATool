@@ -13,8 +13,7 @@
 
 # Test artifacts
 *.ova
-*.vmdk
-*.vmx
 
-# Allow test fixtures
-!**/tests/fixtures/*.vmx
+# Allow test fixtures directory but exclude large binary files
+# The test-vm fixtures are created locally following TESTING.md instructions
+**/tests/fixtures/test-vm/test-flat.vmdk

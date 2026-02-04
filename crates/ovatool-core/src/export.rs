@@ -27,7 +27,7 @@ use crate::ova::OvaWriter;
 use crate::ovf::{DiskInfo, OvfBuilder};
 use crate::pipeline::{CompressionLevel, Pipeline, PipelineConfig};
 use crate::vmdk::{
-    compress_grain, is_sparse_vmdk, parse_descriptor, ExtentType, SparseVmdkReader,
+    compress_grain, is_sparse_vmdk, parse_descriptor, Extent, ExtentType, SparseVmdkReader,
     StreamVmdkWriter, VmdkReader,
 };
 use crate::vmx::{parse_vmx, VmxConfig};
@@ -340,50 +340,94 @@ pub fn export_vm(
         let vmdk_path = vmx_dir.join(&disk_config.file_name);
 
         // Check if this is a sparse VMDK (binary) or a descriptor file (text)
-        let (data_path, capacity_bytes, is_sparse) = if is_sparse_vmdk(&vmdk_path)? {
+        // and determine which processing method to use
+        enum DiskType {
+            /// Single monolithic sparse VMDK file
+            MonolithicSparse(std::path::PathBuf, u64),
+            /// Flat VMDK with separate data file
+            Flat(std::path::PathBuf, u64),
+            /// Split sparse VMDK (twoGbMaxExtentSparse) with multiple extent files
+            SplitSparse(Vec<Extent>, std::path::PathBuf, u64),
+        }
+
+        let disk_type = if is_sparse_vmdk(&vmdk_path)? {
             // Sparse VMDK - the file itself contains the data
             let sparse_reader = SparseVmdkReader::open(&vmdk_path)?;
             let capacity = sparse_reader.capacity();
-            (vmdk_path.clone(), capacity, true)
+            DiskType::MonolithicSparse(vmdk_path.clone(), capacity)
         } else {
-            // Text descriptor - parse it to find the data file
+            // Text descriptor - parse it to find the data file(s)
             let descriptor_content = fs::read_to_string(&vmdk_path)
                 .map_err(|e| Error::io(e, &vmdk_path))?;
             let descriptor = parse_descriptor(&descriptor_content)?;
+            let capacity = descriptor.disk_size_bytes();
 
-            // Find the flat extent (the actual data file)
-            let flat_extent = descriptor
+            // Check for flat extent first (monolithicFlat, twoGbMaxExtentFlat)
+            if let Some(flat_extent) = descriptor
                 .extents
                 .iter()
                 .find(|e| e.extent_type == ExtentType::Flat)
-                .ok_or_else(|| Error::vmdk("No flat extent found in VMDK descriptor"))?;
+            {
+                let flat_path = vmx_dir.join(&flat_extent.filename);
+                DiskType::Flat(flat_path, capacity)
+            } else {
+                // Check for sparse extents (twoGbMaxExtentSparse, etc.)
+                let sparse_extents: Vec<Extent> = descriptor
+                    .extents
+                    .iter()
+                    .filter(|e| e.extent_type == ExtentType::Sparse)
+                    .cloned()
+                    .collect();
 
-            let flat_path = vmx_dir.join(&flat_extent.filename);
-            let capacity = descriptor.disk_size_bytes();
-            (flat_path, capacity, false)
+                if !sparse_extents.is_empty() {
+                    DiskType::SplitSparse(sparse_extents, vmx_dir.to_path_buf(), capacity)
+                } else {
+                    return Err(Error::vmdk(
+                        "No supported extent type found in VMDK descriptor (expected FLAT or SPARSE)"
+                    ));
+                }
+            }
         };
 
-        // Read and compress the disk data
-        let compressed_vmdk = if is_sparse {
-            process_sparse_disk(
-                &data_path,
-                capacity_bytes,
-                &pipeline,
-                compression_level,
-                options.chunk_size,
-                &mut progress,
-                &progress_callback,
-            )?
-        } else {
-            process_disk(
-                &data_path,
-                capacity_bytes,
-                &pipeline,
-                compression_level,
-                options.chunk_size,
-                &mut progress,
-                &progress_callback,
-            )?
+        // Read and compress the disk data based on disk type
+        let (compressed_vmdk, capacity_bytes) = match disk_type {
+            DiskType::MonolithicSparse(path, capacity) => {
+                let vmdk = process_sparse_disk(
+                    &path,
+                    capacity,
+                    &pipeline,
+                    compression_level,
+                    options.chunk_size,
+                    &mut progress,
+                    &progress_callback,
+                )?;
+                (vmdk, capacity)
+            }
+            DiskType::Flat(path, capacity) => {
+                let vmdk = process_disk(
+                    &path,
+                    capacity,
+                    &pipeline,
+                    compression_level,
+                    options.chunk_size,
+                    &mut progress,
+                    &progress_callback,
+                )?;
+                (vmdk, capacity)
+            }
+            DiskType::SplitSparse(extents, base_dir, capacity) => {
+                let vmdk = process_split_sparse_disk(
+                    &extents,
+                    &base_dir,
+                    capacity,
+                    &pipeline,
+                    compression_level,
+                    options.chunk_size,
+                    &mut progress,
+                    &progress_callback,
+                )?;
+                (vmdk, capacity)
+            }
         };
 
         // Store for later writing
@@ -552,6 +596,95 @@ fn process_sparse_disk(
     Ok(vmdk_buffer.into_inner())
 }
 
+/// Process a split sparse VMDK (twoGbMaxExtentSparse): read from multiple extent files,
+/// compress, and create a single streamOptimized VMDK.
+fn process_split_sparse_disk(
+    extents: &[Extent],
+    base_dir: &Path,
+    capacity_bytes: u64,
+    pipeline: &Pipeline,
+    compression_level: u32,
+    chunk_size: usize,
+    progress: &mut ExportProgress,
+    progress_callback: &Option<ProgressCallback>,
+) -> Result<Vec<u8>> {
+    // Create a virtual reader that chains multiple sparse extent files
+    // We'll collect chunks from all extents in order
+    let mut all_chunks: Vec<Vec<u8>> = Vec::new();
+    let mut partial_chunk: Vec<u8> = Vec::new();
+
+    for extent in extents {
+        let extent_path = base_dir.join(&extent.filename);
+        let reader = SparseVmdkReader::open(&extent_path)?;
+
+        // Read chunks from this extent
+        for chunk_result in reader.chunks(chunk_size) {
+            let chunk = chunk_result?;
+
+            // If we have a partial chunk from the previous extent, combine with current data
+            if !partial_chunk.is_empty() {
+                partial_chunk.extend_from_slice(&chunk);
+
+                // Extract full chunks from the combined data
+                while partial_chunk.len() >= chunk_size {
+                    let full_chunk: Vec<u8> = partial_chunk.drain(..chunk_size).collect();
+                    all_chunks.push(full_chunk);
+                }
+            } else if chunk.len() == chunk_size {
+                all_chunks.push(chunk);
+            } else {
+                // This is a partial chunk (last chunk of extent), save for combining
+                partial_chunk = chunk;
+            }
+        }
+    }
+
+    // Don't forget any remaining partial chunk
+    if !partial_chunk.is_empty() {
+        all_chunks.push(partial_chunk);
+    }
+
+    let total_chunks = all_chunks.len();
+
+    // Compress chunks in parallel
+    let compressed_chunks: Vec<Vec<u8>> = pipeline.process(all_chunks, |_idx, chunk| {
+        compress_grain(&chunk, compression_level)
+    })?;
+
+    // Create streamOptimized VMDK in memory
+    let mut vmdk_buffer = Cursor::new(Vec::new());
+    let mut vmdk_writer = StreamVmdkWriter::new(&mut vmdk_buffer, capacity_bytes)?;
+
+    // Write compressed grains
+    let mut bytes_written = 0u64;
+    for (chunk_idx, compressed_chunk) in compressed_chunks.into_iter().enumerate() {
+        // Calculate LBA for this chunk (in sectors)
+        let chunk_offset_bytes = chunk_idx as u64 * chunk_size as u64;
+        let lba = chunk_offset_bytes / 512; // Convert to sectors
+
+        // Write the grain
+        vmdk_writer.write_grain(lba, &compressed_chunk)?;
+
+        // Update progress
+        let original_chunk_size = if chunk_idx < total_chunks - 1 {
+            chunk_size as u64
+        } else {
+            capacity_bytes - (chunk_idx as u64 * chunk_size as u64)
+        };
+        bytes_written += original_chunk_size;
+        progress.bytes_processed = bytes_written;
+
+        if let Some(ref callback) = progress_callback {
+            callback(progress.clone());
+        }
+    }
+
+    // Finish the VMDK
+    vmdk_writer.finish()?;
+
+    Ok(vmdk_buffer.into_inner())
+}
+
 /// Calculate total disk size from VMX config.
 fn calculate_total_disk_size(config: &VmxConfig, vmx_dir: &Path) -> Result<u64> {
     let mut total = 0u64;
@@ -571,13 +704,23 @@ fn calculate_total_disk_size(config: &VmxConfig, vmx_dir: &Path) -> Result<u64> 
                     .map_err(|e| Error::io(e, &vmdk_path))?;
                 let descriptor = parse_descriptor(&content)?;
 
-                // Find the flat extent to get actual file size
+                // Try flat extent first
                 if let Some(flat_extent) = descriptor.extents.iter().find(|e| e.extent_type == ExtentType::Flat) {
                     let flat_path = vmx_dir.join(&flat_extent.filename);
                     if flat_path.exists() {
                         let metadata = fs::metadata(&flat_path)
                             .map_err(|e| Error::io(e, &flat_path))?;
                         total += metadata.len();
+                    }
+                } else {
+                    // Try sparse extents (split sparse VMDK)
+                    for extent in descriptor.extents.iter().filter(|e| e.extent_type == ExtentType::Sparse) {
+                        let extent_path = vmx_dir.join(&extent.filename);
+                        if extent_path.exists() {
+                            let metadata = fs::metadata(&extent_path)
+                                .map_err(|e| Error::io(e, &extent_path))?;
+                            total += metadata.len();
+                        }
                     }
                 }
             }

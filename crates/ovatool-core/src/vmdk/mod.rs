@@ -3,6 +3,7 @@
 //! This module provides functionality for reading and processing VMDK files,
 //! including sparse disk formats and stream-optimized conversion.
 
+pub mod descriptor;
 pub mod reader;
 
-// TODO: Re-export public types from reader
+pub use descriptor::{parse_descriptor, Extent, ExtentType, VmdkDescriptor};
